@@ -840,7 +840,11 @@
     </div>
     
     <script>
-        const API_URL = 'http://localhost:3000/api';
+        // Автоматически определяем URL API в зависимости от окружения
+        const API_URL = window.location.hostname === 'localhost' 
+            ? 'http://localhost:3000/api'  // Для локальной разработки
+            : window.location.origin + '/api';  // Для продакшена (Railway)
+        
         let stages = [];
         let expandedStages = new Set();
         let selectedIcon = '📋';
