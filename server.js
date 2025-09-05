@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
 
@@ -11,60 +11,69 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Initialize SQLite database
-const db = new sqlite3.Database('./tender_project.db');
-
-// Create tables and initialize with default data
-db.serialize(() => {
-    // Create stages table
-    db.run(`
-        CREATE TABLE IF NOT EXISTS stages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            number INTEGER,
-            name TEXT,
-            icon TEXT,
-            weeks TEXT,
-            hours INTEGER,
-            cost INTEGER,
-            status TEXT,
-            brief TEXT,
-            description TEXT,
-            progress INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-
-    // Create tasks table
-    db.run(`
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            stage_id INTEGER,
-            text TEXT,
-            completed BOOLEAN DEFAULT 0,
-            position INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (stage_id) REFERENCES stages(id) ON DELETE CASCADE
-        )
-    `);
-
-    // Create indexes
-    db.run(`CREATE INDEX IF NOT EXISTS idx_stage_status ON stages(status)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_task_stage ON tasks(stage_id)`);
-    
-    // Check if data exists
-    db.get("SELECT COUNT(*) as count FROM stages", (err, row) => {
-        if (row && row.count === 0) {
-            console.log('Initializing database with default data...');
-            initializeDefaultData();
-        } else {
-            console.log(`Database contains ${row ? row.count : 0} stages`);
-        }
-    });
+// PostgreSQL connection
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? {
+        rejectUnauthorized: false
+    } : false
 });
 
+// Initialize database tables
+async function initializeDatabase() {
+    try {
+        // Create stages table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS stages (
+                id SERIAL PRIMARY KEY,
+                number INTEGER,
+                name TEXT,
+                icon TEXT,
+                weeks TEXT,
+                hours INTEGER,
+                cost INTEGER,
+                status TEXT,
+                brief TEXT,
+                description TEXT,
+                progress INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Create tasks table
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                stage_id INTEGER REFERENCES stages(id) ON DELETE CASCADE,
+                text TEXT,
+                completed BOOLEAN DEFAULT false,
+                position INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Create indexes
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_stage_status ON stages(status)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_task_stage ON tasks(stage_id)`);
+        
+        // Check if data exists
+        const result = await pool.query('SELECT COUNT(*) as count FROM stages');
+        const count = parseInt(result.rows[0].count);
+        
+        if (count === 0) {
+            console.log('Initializing database with default data...');
+            await initializeDefaultData();
+        } else {
+            console.log(`Database contains ${count} stages`);
+        }
+    } catch (err) {
+        console.error('Database initialization error:', err);
+    }
+}
+
 // Initialize default data
-function initializeDefaultData() {
+async function initializeDefaultData() {
     const defaultStages = [
         {
             number: 1,
@@ -231,563 +240,384 @@ function initializeDefaultData() {
         }
     ];
 
-    const stageStmt = db.prepare(`
-        INSERT INTO stages (number, name, icon, weeks, hours, cost, status, brief, description, progress)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    const taskStmt = db.prepare(`
-        INSERT INTO tasks (stage_id, text, completed, position)
-        VALUES (?, ?, ?, ?)
-    `);
-
-    defaultStages.forEach(stage => {
-        stageStmt.run(
-            stage.number,
-            stage.name,
-            stage.icon,
-            stage.weeks,
-            stage.hours,
-            stage.cost,
-            stage.status,
-            stage.brief,
-            stage.description,
-            stage.progress,
-            function(err) {
-                if (!err) {
-                    const stageId = this.lastID;
-                    stage.tasks.forEach((task, index) => {
-                        taskStmt.run(stageId, task.text, task.completed ? 1 : 0, index);
-                    });
-                }
+    try {
+        for (const stage of defaultStages) {
+            const stageResult = await pool.query(`
+                INSERT INTO stages (number, name, icon, weeks, hours, cost, status, brief, description, progress)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id
+            `, [stage.number, stage.name, stage.icon, stage.weeks, stage.hours, 
+                stage.cost, stage.status, stage.brief, stage.description, stage.progress]);
+            
+            const stageId = stageResult.rows[0].id;
+            
+            for (let i = 0; i < stage.tasks.length; i++) {
+                const task = stage.tasks[i];
+                await pool.query(`
+                    INSERT INTO tasks (stage_id, text, completed, position)
+                    VALUES ($1, $2, $3, $4)
+                `, [stageId, task.text, task.completed, i]);
             }
-        );
-    });
-
-    stageStmt.finalize();
-    taskStmt.finalize();
+        }
+        console.log('Default data initialized successfully');
+    } catch (err) {
+        console.error('Error initializing default data:', err);
+    }
 }
 
 // API Routes
 
 // Get all stages with tasks
-app.get('/api/stages', (req, res) => {
-    db.all(`
-        SELECT * FROM stages ORDER BY number
-    `, (err, stages) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
+app.get('/api/stages', async (req, res) => {
+    try {
+        const stagesResult = await pool.query('SELECT * FROM stages ORDER BY number');
+        const stages = stagesResult.rows;
+        
+        for (const stage of stages) {
+            const tasksResult = await pool.query(
+                'SELECT * FROM tasks WHERE stage_id = $1 ORDER BY position, id',
+                [stage.id]
+            );
+            stage.tasks = tasksResult.rows.map(t => ({
+                id: t.id,
+                text: t.text,
+                completed: t.completed
+            }));
         }
         
-        // Get tasks for each stage
-        const stagesWithTasks = [];
-        let processed = 0;
-        
-        if (stages.length === 0) {
-            res.json([]);
-            return;
-        }
-        
-        stages.forEach(stage => {
-            db.all(`
-                SELECT * FROM tasks 
-                WHERE stage_id = ? 
-                ORDER BY position, id
-            `, [stage.id], (err, tasks) => {
-                if (!err) {
-                    stage.tasks = tasks.map(t => ({
-                        id: t.id,
-                        text: t.text,
-                        completed: t.completed === 1
-                    }));
-                } else {
-                    stage.tasks = [];
-                }
-                
-                stagesWithTasks.push(stage);
-                processed++;
-                
-                if (processed === stages.length) {
-                    // Sort by number before sending
-                    stagesWithTasks.sort((a, b) => a.number - b.number);
-                    res.json(stagesWithTasks);
-                }
-            });
-        });
-    });
+        res.json(stages);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Create new stage
-app.post('/api/stages', (req, res) => {
+app.post('/api/stages', async (req, res) => {
     const { name, icon, weeks, hours, cost, brief, description, tasks } = req.body;
     
-    // Get max stage number
-    db.get(`SELECT MAX(number) as maxNum FROM stages`, (err, row) => {
-        const number = (row && row.maxNum) ? row.maxNum + 1 : 1;
+    try {
+        // Get max stage number
+        const maxResult = await pool.query('SELECT MAX(number) as max_num FROM stages');
+        const number = (maxResult.rows[0].max_num || 0) + 1;
         
-        db.run(`
+        const stageResult = await pool.query(`
             INSERT INTO stages (number, name, icon, weeks, hours, cost, status, brief, description, progress)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)
-        `, [number, name, icon || '📋', weeks, hours, cost, brief, description], function(err) {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
-            
-            const stageId = this.lastID;
-            
-            // Add tasks if provided
-            if (tasks && tasks.length > 0) {
-                const taskStmt = db.prepare(`
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, 0)
+            RETURNING *
+        `, [number, name, icon || '📋', weeks, hours, cost, brief, description]);
+        
+        const stage = stageResult.rows[0];
+        
+        // Add tasks if provided
+        if (tasks && tasks.length > 0) {
+            for (let i = 0; i < tasks.length; i++) {
+                await pool.query(`
                     INSERT INTO tasks (stage_id, text, completed, position)
-                    VALUES (?, ?, 0, ?)
-                `);
-                
-                tasks.forEach((taskText, index) => {
-                    taskStmt.run(stageId, taskText, index);
-                });
-                
-                taskStmt.finalize();
+                    VALUES ($1, $2, false, $3)
+                `, [stage.id, tasks[i], i]);
             }
-            
-            res.json({ 
-                id: stageId, 
-                number,
-                name,
-                icon: icon || '📋',
-                weeks,
-                hours,
-                cost,
-                status: 'pending',
-                brief,
-                description,
-                progress: 0
-            });
-        });
-    });
+        }
+        
+        res.json(stage);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Update stage
-app.put('/api/stages/:id', (req, res) => {
+app.put('/api/stages/:id', async (req, res) => {
     const { id } = req.params;
-    const { status, brief, description, progress, name, icon, weeks, hours, cost } = req.body;
+    const updates = req.body;
     
-    const updates = [];
+    const setClause = [];
     const values = [];
+    let paramCount = 1;
     
-    if (status !== undefined) {
-        updates.push('status = ?');
-        values.push(status);
-    }
-    if (brief !== undefined) {
-        updates.push('brief = ?');
-        values.push(brief);
-    }
-    if (description !== undefined) {
-        updates.push('description = ?');
-        values.push(description);
-    }
-    if (progress !== undefined) {
-        updates.push('progress = ?');
-        values.push(progress);
-    }
-    if (name !== undefined) {
-        updates.push('name = ?');
-        values.push(name);
-    }
-    if (icon !== undefined) {
-        updates.push('icon = ?');
-        values.push(icon);
-    }
-    if (weeks !== undefined) {
-        updates.push('weeks = ?');
-        values.push(weeks);
-    }
-    if (hours !== undefined) {
-        updates.push('hours = ?');
-        values.push(hours);
-    }
-    if (cost !== undefined) {
-        updates.push('cost = ?');
-        values.push(cost);
+    for (const [key, value] of Object.entries(updates)) {
+        if (value !== undefined) {
+            setClause.push(`${key} = $${paramCount}`);
+            values.push(value);
+            paramCount++;
+        }
     }
     
-    if (updates.length === 0) {
-        res.status(400).json({ error: 'No fields to update' });
-        return;
+    if (setClause.length === 0) {
+        return res.status(400).json({ error: 'No fields to update' });
     }
     
     values.push(id);
     
-    db.run(`
-        UPDATE stages 
-        SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    `, values, function(err) {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
-        res.json({ success: true, changes: this.changes });
-    });
+    try {
+        const result = await pool.query(`
+            UPDATE stages 
+            SET ${setClause.join(', ')}, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $${paramCount}
+        `, values);
+        
+        res.json({ success: true, changes: result.rowCount });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Delete stage
-app.delete('/api/stages/:id', (req, res) => {
+app.delete('/api/stages/:id', async (req, res) => {
     const { id } = req.params;
     
-    db.serialize(() => {
-        // First delete all tasks for this stage
-        db.run(`DELETE FROM tasks WHERE stage_id = ?`, [id], (err) => {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
-            
-            // Then delete the stage
-            db.run(`DELETE FROM stages WHERE id = ?`, [id], function(err) {
-                if (err) {
-                    res.status(500).json({ error: err.message });
-                    return;
-                }
-                
-                // Renumber remaining stages
-                db.run(`
-                    UPDATE stages 
-                    SET number = (
-                        SELECT COUNT(*) + 1 
-                        FROM stages s2 
-                        WHERE s2.number < stages.number
-                    )
-                `, (err) => {
-                    if (err) {
-                        console.error('Error renumbering stages:', err);
-                    }
-                    res.json({ success: true, changes: this.changes });
-                });
-            });
-        });
-    });
+    try {
+        await pool.query('BEGIN');
+        
+        // Delete tasks first (CASCADE should handle this, but being explicit)
+        await pool.query('DELETE FROM tasks WHERE stage_id = $1', [id]);
+        
+        // Delete the stage
+        const result = await pool.query('DELETE FROM stages WHERE id = $1', [id]);
+        
+        // Renumber remaining stages
+        await pool.query(`
+            UPDATE stages 
+            SET number = subquery.new_number
+            FROM (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY number) as new_number
+                FROM stages
+            ) as subquery
+            WHERE stages.id = subquery.id
+        `);
+        
+        await pool.query('COMMIT');
+        res.json({ success: true, changes: result.rowCount });
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Add task
-app.post('/api/stages/:stageId/tasks', (req, res) => {
+app.post('/api/stages/:stageId/tasks', async (req, res) => {
     const { stageId } = req.params;
     const { text } = req.body;
     
-    // Get max position
-    db.get(`
-        SELECT MAX(position) as maxPos FROM tasks WHERE stage_id = ?
-    `, [stageId], (err, row) => {
-        const position = (row && row.maxPos !== null) ? row.maxPos + 1 : 0;
+    try {
+        const maxResult = await pool.query(
+            'SELECT MAX(position) as max_pos FROM tasks WHERE stage_id = $1',
+            [stageId]
+        );
+        const position = (maxResult.rows[0].max_pos !== null ? maxResult.rows[0].max_pos : -1) + 1;
         
-        db.run(`
+        const result = await pool.query(`
             INSERT INTO tasks (stage_id, text, completed, position)
-            VALUES (?, ?, 0, ?)
-        `, [stageId, text, position], function(err) {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
-            res.json({ 
-                id: this.lastID, 
-                text, 
-                completed: false,
-                position 
-            });
-        });
-    });
+            VALUES ($1, $2, false, $3)
+            RETURNING *
+        `, [stageId, text, position]);
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Toggle task
-app.put('/api/tasks/:id/toggle', (req, res) => {
+app.put('/api/tasks/:id/toggle', async (req, res) => {
     const { id } = req.params;
     
-    db.run(`
-        UPDATE tasks 
-        SET completed = NOT completed
-        WHERE id = ?
-    `, [id], function(err) {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+    try {
+        const result = await pool.query(`
+            UPDATE tasks 
+            SET completed = NOT completed
+            WHERE id = $1
+            RETURNING *
+        `, [id]);
         
-        // Get updated task
-        db.get(`SELECT * FROM tasks WHERE id = ?`, [id], (err, task) => {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
-            res.json({ 
-                success: true, 
-                completed: task.completed === 1 
-            });
+        res.json({ 
+            success: true, 
+            completed: result.rows[0].completed 
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Delete task
-app.delete('/api/tasks/:id', (req, res) => {
+app.delete('/api/tasks/:id', async (req, res) => {
     const { id } = req.params;
     
-    db.run(`DELETE FROM tasks WHERE id = ?`, [id], function(err) {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
-        res.json({ success: true, changes: this.changes });
-    });
+    try {
+        const result = await pool.query('DELETE FROM tasks WHERE id = $1', [id]);
+        res.json({ success: true, changes: result.rowCount });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Update task text
-app.put('/api/tasks/:id', (req, res) => {
+app.put('/api/tasks/:id', async (req, res) => {
     const { id } = req.params;
     const { text } = req.body;
     
-    db.run(`
-        UPDATE tasks 
-        SET text = ?
-        WHERE id = ?
-    `, [text, id], function(err) {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+    try {
+        await pool.query(`
+            UPDATE tasks 
+            SET text = $1
+            WHERE id = $2
+        `, [text, id]);
+        
         res.json({ success: true });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Get statistics
-app.get('/api/stats', (req, res) => {
-    const stats = {};
-    
-    db.all(`
-        SELECT 
-            COUNT(*) as total_stages,
-            SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) as completed,
-            SUM(CASE WHEN status = 'progress' THEN 1 ELSE 0 END) as in_progress,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN status = 'testing' THEN 1 ELSE 0 END) as testing,
-            AVG(progress) as avg_progress,
-            SUM(hours * progress / 100) as hours_worked,
-            SUM(hours) as total_hours
-        FROM stages
-    `, (err, row) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+app.get('/api/stats', async (req, res) => {
+    try {
+        const statsResult = await pool.query(`
+            SELECT 
+                COUNT(*) as total_stages,
+                SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'progress' THEN 1 ELSE 0 END) as in_progress,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status = 'testing' THEN 1 ELSE 0 END) as testing,
+                AVG(progress) as avg_progress,
+                SUM(hours * progress / 100.0) as hours_worked,
+                SUM(hours) as total_hours
+            FROM stages
+        `);
         
-        db.get(`
+        const taskStatsResult = await pool.query(`
             SELECT 
                 COUNT(*) as total_tasks,
-                SUM(completed) as completed_tasks
+                SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed_tasks
             FROM tasks
-        `, (err, taskStats) => {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
-            
-            res.json({
-                ...row[0],
-                ...taskStats
-            });
+        `);
+        
+        res.json({
+            ...statsResult.rows[0],
+            ...taskStatsResult.rows[0]
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Export data
-app.get('/api/export', (req, res) => {
-    db.all(`
-        SELECT * FROM stages ORDER BY number
-    `, (err, stages) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+app.get('/api/export', async (req, res) => {
+    try {
+        const stagesResult = await pool.query('SELECT * FROM stages ORDER BY number');
+        const stages = stagesResult.rows;
         
         const exportData = [];
-        let processed = 0;
         
-        if (stages.length === 0) {
-            res.json([]);
-            return;
+        for (const stage of stages) {
+            const tasksResult = await pool.query(
+                'SELECT text, completed FROM tasks WHERE stage_id = $1 ORDER BY position, id',
+                [stage.id]
+            );
+            
+            exportData.push({
+                number: stage.number,
+                name: stage.name,
+                icon: stage.icon,
+                weeks: stage.weeks,
+                hours: stage.hours,
+                cost: stage.cost,
+                status: stage.status,
+                brief: stage.brief,
+                description: stage.description,
+                progress: stage.progress,
+                tasks: tasksResult.rows.map(t => ({
+                    text: t.text,
+                    completed: t.completed
+                }))
+            });
         }
         
-        stages.forEach(stage => {
-            db.all(`
-                SELECT text, completed FROM tasks 
-                WHERE stage_id = ? 
-                ORDER BY position, id
-            `, [stage.id], (err, tasks) => {
-                const stageData = {
-                    number: stage.number,
-                    name: stage.name,
-                    icon: stage.icon,
-                    weeks: stage.weeks,
-                    hours: stage.hours,
-                    cost: stage.cost,
-                    status: stage.status,
-                    brief: stage.brief,
-                    description: stage.description,
-                    progress: stage.progress,
-                    tasks: tasks.map(t => ({
-                        text: t.text,
-                        completed: t.completed === 1
-                    }))
-                };
-                
-                exportData.push(stageData);
-                processed++;
-                
-                if (processed === stages.length) {
-                    exportData.sort((a, b) => a.number - b.number);
-                    res.setHeader('Content-Type', 'application/json');
-                    res.setHeader('Content-Disposition', 'attachment; filename="project_stages.json"');
-                    res.json(exportData);
-                }
-            });
-        });
-    });
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', 'attachment; filename="project_stages.json"');
+        res.json(exportData);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Import data
-app.post('/api/import', (req, res) => {
+app.post('/api/import', async (req, res) => {
     const stages = req.body;
     
     if (!Array.isArray(stages)) {
-        res.status(400).json({ error: 'Invalid data format' });
-        return;
+        return res.status(400).json({ error: 'Invalid data format' });
     }
     
-    db.serialize(() => {
-        db.run('BEGIN TRANSACTION');
+    try {
+        await pool.query('BEGIN');
         
         // Clear existing data
-        db.run('DELETE FROM tasks');
-        db.run('DELETE FROM stages');
+        await pool.query('DELETE FROM tasks');
+        await pool.query('DELETE FROM stages');
         
-        const stageStmt = db.prepare(`
-            INSERT INTO stages (number, name, icon, weeks, hours, cost, status, brief, description, progress)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-        
-        const taskStmt = db.prepare(`
-            INSERT INTO tasks (stage_id, text, completed, position)
-            VALUES (?, ?, ?, ?)
-        `);
-        
-        let stageCount = 0;
-        
-        stages.forEach(stage => {
-            stageStmt.run(
-                stage.number,
-                stage.name,
-                stage.icon,
-                stage.weeks,
-                stage.hours,
-                stage.cost,
-                stage.status,
-                stage.brief,
-                stage.description,
-                stage.progress || 0,
-                function(err) {
-                    if (!err) {
-                        const stageId = this.lastID;
-                        
-                        if (stage.tasks && stage.tasks.length > 0) {
-                            stage.tasks.forEach((task, index) => {
-                                taskStmt.run(
-                                    stageId, 
-                                    task.text, 
-                                    task.completed ? 1 : 0, 
-                                    index
-                                );
-                            });
-                        }
-                    }
-                    
-                    stageCount++;
-                    if (stageCount === stages.length) {
-                        stageStmt.finalize();
-                        taskStmt.finalize();
-                        
-                        db.run('COMMIT', (err) => {
-                            if (err) {
-                                db.run('ROLLBACK');
-                                res.status(500).json({ error: err.message });
-                            } else {
-                                res.json({ success: true, imported: stages.length });
-                            }
-                        });
-                    }
+        for (const stage of stages) {
+            const stageResult = await pool.query(`
+                INSERT INTO stages (number, name, icon, weeks, hours, cost, status, brief, description, progress)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id
+            `, [stage.number, stage.name, stage.icon, stage.weeks, stage.hours,
+                stage.cost, stage.status, stage.brief, stage.description, stage.progress || 0]);
+            
+            const stageId = stageResult.rows[0].id;
+            
+            if (stage.tasks && stage.tasks.length > 0) {
+                for (let i = 0; i < stage.tasks.length; i++) {
+                    const task = stage.tasks[i];
+                    await pool.query(`
+                        INSERT INTO tasks (stage_id, text, completed, position)
+                        VALUES ($1, $2, $3, $4)
+                    `, [stageId, task.text, task.completed, i]);
                 }
-            );
-        });
-    });
+            }
+        }
+        
+        await pool.query('COMMIT');
+        res.json({ success: true, imported: stages.length });
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Reset to default data
-app.post('/api/reset', (req, res) => {
-    db.serialize(() => {
-        // Удаляем старые данные
-        db.run('DELETE FROM tasks', (err) => {
-            if (err) {
-                console.error('Error deleting tasks:', err);
-            }
-        });
+app.post('/api/reset', async (req, res) => {
+    try {
+        await pool.query('BEGIN');
+        await pool.query('DELETE FROM tasks');
+        await pool.query('DELETE FROM stages');
+        await pool.query('COMMIT');
         
-        db.run('DELETE FROM stages', (err) => {
-            if (err) {
-                console.error('Error deleting stages:', err);
-            } else {
-                // После успешной очистки инициализируем заново
-                setTimeout(() => {
-                    initializeDefaultData();
-                    setTimeout(() => {
-                        res.json({ success: true, message: 'Data reset to default' });
-                    }, 500);
-                }, 100);
-            }
-        });
-    });
+        await initializeDefaultData();
+        res.json({ success: true, message: 'Data reset to default' });
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Start server
-app.listen(PORT, () => {
-    console.log(`
-    ╔════════════════════════════════════════════╗
-    ║   Tender Project Management System         ║
-    ║   Server running at:                       ║
-    ║   http://localhost:${PORT}                 ║
-    ║                                            ║
-    ║   Database: tender_project.db              ║
-    ║   API Endpoints:                           ║
-    ║   GET    /api/stages                       ║
-    ║   POST   /api/stages                       ║
-    ║   PUT    /api/stages/:id                   ║
-    ║   DELETE /api/stages/:id                   ║
-    ║   POST   /api/stages/:id/tasks             ║
-    ║   PUT    /api/tasks/:id/toggle             ║
-    ║   DELETE /api/tasks/:id                    ║
-    ║   GET    /api/stats                        ║
-    ║   GET    /api/export                       ║
-    ║   POST   /api/import                       ║
-    ║   POST   /api/reset                        ║
-    ╚════════════════════════════════════════════╝
-    `);
+// Start server and initialize database
+initializeDatabase().then(() => {
+    app.listen(PORT, () => {
+        console.log(`
+        ╔════════════════════════════════════════════╗
+        ║   Tender Project Management System         ║
+        ║   Server running at:                       ║
+        ║   http://localhost:${PORT}                     ║
+        ║                                            ║
+        ║   Database: PostgreSQL                     ║
+        ║   Environment: ${process.env.NODE_ENV || 'development'}                  ║
+        ╚════════════════════════════════════════════╝
+        `);
+    });
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-    db.close((err) => {
-        if (err) {
-            console.error(err.message);
-        }
-        console.log('\nDatabase connection closed.');
-        process.exit(0);
-    });
+process.on('SIGINT', async () => {
+    await pool.end();
+    console.log('\nDatabase connection closed.');
+    process.exit(0);
 });
